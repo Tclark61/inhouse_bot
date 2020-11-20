@@ -2,13 +2,30 @@ version: "3.8"
 
 services:
   inhouse_bot:
-    image: mrtolkien/inhouse_bot
-    container_name: inhouse_bot
+    image: mrtolkien/inhouse_bot:beta
     build:
       context: .
-    volumes:
-    - type: bind
-      source: ./data
-      target: /data
     env_file:
     - .env
+    volumes:
+    - type: bind
+      source: ./
+      target: /inhouse_bot
+
+  db:
+    image: postgres:alpine
+    # Optional volume to save data long-term, not used in development
+    # volumes:
+    # - pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: pwd
+      POSTGRES_DB: inhouse_bot
+
+  adminer:
+    image: adminer
+    ports:
+      - 8080:8080
+
+# If you want to define a volume to save your postgres data, it’s done here
+# volumes:
+#     pgdata:

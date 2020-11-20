@@ -1,303 +1,209 @@
-from collections import defaultdict
-from datetime import datetime
-
-import discord
-from discord.ext import commands
-from rapidfuzz import process
-
+import lol_id_tools
+import sqlalchemy
+from discord.ext import commands, menus
+from discord.ext.commands import guild_only
+from sqlalchemy import func
 from tabulate import tabulate
 import inflect
-import dateparser
-import matplotlib
-import matplotlib.pyplot as plt
-import mplcyberpunk
-import tempfile
+
+
+from inhouse_bot.orm import session_scope, GameParticipant, Game, Player, PlayerRating
+from inhouse_bot.common_utils.fields import ChampionNameConverter, RoleConverter
+from inhouse_bot.common_utils.get_last_game import get_last_game
 
 from inhouse_bot.inhouse_bot import InhouseBot
-from inhouse_bot.sqlite.game import Game
-from inhouse_bot.sqlite.game_participant import GameParticipant
-from inhouse_bot.sqlite.player import Player
-from inhouse_bot.sqlite.player_rating import PlayerRating
-from inhouse_bot.sqlite.sqlite_utils import roles_list, get_session
-
-import lol_id_tools as lit
+from inhouse_bot.stats_menus.history_pages import HistoryPagesSource
+from inhouse_bot.stats_menus.ranking_pages import RankingPagesSource
 
 inflect_engine = inflect.engine()
-matplotlib.use("Agg")
-plt.style.use("cyberpunk")
+
+
+# TODO MEDIUM PRIO Make all outputs into beautiful menus and embeds
+#   Make an embed visualisation function outside of the command
 
 
 class StatsCog(commands.Cog, name="Stats"):
+    """
+    Display game-related statistics
+    """
+
     def __init__(self, bot: InhouseBot):
-        """
-        :param bot: the bot to attach the cog to
-        """
         self.bot = bot
 
-    @commands.command(help_index=0, aliases=["match_history", "mh"])
-    async def history(self, ctx: commands.Context, user_id=None, display_games=20):
+    @commands.command()
+    @guild_only()
+    async def champion(
+        self, ctx: commands.Context, champion_id: ChampionNameConverter(), game_id: int = None
+    ):
         """
-        Returns your match history in a table.
+        Saves the champion you used in your last game
 
-        If user_id is supplied, shows the user’s match history. Requires being on the same team or admin.
-        display_games specifies how many games to show and is 20 by default.
+        Older games can be filled with !champion champion_name game_id
+        You can find the ID of the games you played with !history
+
+        Example:
+            !champion riven
+            !champion riven 1
         """
-        try:
-            player = await self.get_player_with_team_check(ctx, user_id)
-        except PermissionError:
-            return
 
-        games_list = player.get_latest_games(display_games)
+        with session_scope() as session:
+            if not game_id:
+                game, participant = get_last_game(
+                    player_id=ctx.author.id, server_id=ctx.guild.id, session=session
+                )
+            else:
+                game, participant = (
+                    session.query(Game, GameParticipant)
+                    .select_from(Game)
+                    .join(GameParticipant)
+                    .filter(Game.id == game_id)
+                    .filter(GameParticipant.player_id == ctx.author.id)
+                ).one_or_none()
 
-        table = [["Game ID", "Date", "Role", "Champion", "Result"]]
-        for game, participant in games_list:
-            table.append(
-                [
-                    game.id,
-                    game.date.date(),
-                    participant.role,
-                    lit.get_name(participant.champion_id) or "Unknown",
-                    "Win" if game.winner == participant.team else "Loss",
-                ]
-            )
+            # We write down the champion
+            participant.champion_id = champion_id
 
-        await ctx.send(f'```{tabulate(table, headers="firstrow")}```')
-
-    @commands.command(help_index=1, aliases=["ranks"])
-    async def rank(self, ctx: commands.Context, user_id=None):
-        """
-        Returns your rank in the server.
-        """
-        if not ctx.guild:
-            await ctx.send("!rank can only be called inside a Discord server.", delete_after=30)
-            return
-
-        try:
-            player = await self.get_player_with_team_check(ctx, user_id)
-        except PermissionError:
-            return
-
-        guild_player_ids = [m.id for m in ctx.guild.members]
-
-        table = []
-        for role in player.ratings:
-            rating = player.ratings[role]
-            table.append(
-                [f"{rating.role.capitalize()}", inflect_engine.ordinal(rating.get_rank(guild_player_ids))]
-            )
-
-        # Sorting the table by rank
-        table = sorted(table, key=lambda x: x[1])
-        table.insert(0, ["Role", "Rank"])
-
-        await ctx.send(f"Ranks for {player.name}:" f'```{tabulate(table, headers="firstrow")}```')
-
-    @commands.command(help_index=2, aliases=["rankings"])
-    async def ranking(self, ctx: commands.Context, role="all"):
-        """
-        Returns the top 20 players for the selected role in the server.
-        """
-        if not ctx.guild:
-            await ctx.send("!ranking can only be called inside a Discord server.", delete_after=30)
-            return
-
-        if role == "all":
-            clean_role = role
-        else:
-            clean_role, score = process.extractOne(role, roles_list)
-            if score < 80:
-                await ctx.send(self.bot.role_not_understood, delete_after=30)
-                return
-
-        session = get_session()
-
-        guild_player_ids = [m.id for m in ctx.guild.members]
-
-        role_ranking = (
-            session.query(PlayerRating)
-            .join(Player)
-            .order_by(-PlayerRating.mmr)
-            .filter(PlayerRating.games > 0)
-            .filter(Player.discord_id.in_(guild_player_ids))
-        )
-
-        if clean_role != "all":
-            role_ranking = role_ranking.filter(PlayerRating.role == clean_role)
-
-        table = [["Rank", "Name", "MMR", "Games"] + ["Role" if clean_role == "all" else None]]
-
-        for rank, rating in enumerate(role_ranking.limit(20)):
-            table.append(
-                [
-                    inflect_engine.ordinal(rank + 1),
-                    rating.player.name,
-                    f"{rating.mmr:.1f}",
-                    rating.get_games_total(),
-                ]
-                + [rating.role if clean_role == "all" else None]
-            )
-
-        await ctx.send(f"Ranking for {clean_role} is:\n" f'```{tabulate(table, headers="firstrow")}```')
-
-    @commands.command(help_index=3, aliases=["MMR", "stats", "rating", "ratings"])
-    async def mmr(self, ctx: commands.Context, user_id=None, date_start=None):
-        """ Returns your MMR, games total, and winrate for all roles.
-
-        date_start can be used to define a lower limit on stats.
-
-        !stats 709581697410400307 "two weeks ago"
-        """
-        try:
-            player = await self.get_player_with_team_check(ctx, user_id)
-        except PermissionError:
-            return
-
-        date_start = dateparser.parse(date_start) if date_start else date_start
-
-        stats = player.get_roles_stats(date_start)
-
-        table = []
-        for role in stats:
-            table.append(
-                [
-                    f"{role.capitalize()}",
-                    f"{player.ratings[role].mmr:.1f}",
-                    stats[role].games,
-                    f"{stats[role].wins / stats[role].games * 100:.1f}%",
-                ]
-            )
-
-        # Sorting the table by games total
-        table = sorted(table, key=lambda x: -x[2])
-        # Adding the header last to not screw with the sorting
-        table.insert(0, ["Role", "MMR", "Games", "Winrate"])
-
-        await ctx.send(f'```{tabulate(table, headers="firstrow")}```')
-
-    @commands.command(help_index=4, aliases=["rating_history", "ratings_history"])
-    async def mmr_history(self, ctx: commands.Context, user_id=None, date_start=None):
-        """Displays a graph of your MMR history over the past month.
-        """
-        try:
-            player = await self.get_player_with_team_check(ctx, user_id)
-        except PermissionError:
-            return
-
-        if not date_start:
-            date_start = dateparser.parse("one month ago")
-        else:
-            date_start = dateparser.parse(date_start)
-
-        session = get_session()
-
-        # TODO Use the player_rating.game_participant_objects field?
-        participants = (
-            session.query(Game, GameParticipant)
-            .join(GameParticipant)
-            .filter(GameParticipant.player_id == player.discord_id)
-            .filter(Game.date > date_start)
-        )
-
-        mmr_history = defaultdict(lambda: {"dates": [], "mmr": []})
-
-        for game, participant in participants:
-            mmr_history[participant.role]["dates"].append(game.date)
-            mmr_history[participant.role]["mmr"].append(participant.mmr)
-
-        legend = []
-        for role in mmr_history:
-            # We add a data point at the current timestamp with the player’s current MMR
-            mmr_history[role]["dates"].append(datetime.now())
-            mmr_history[role]["mmr"].append(player.ratings[role].mmr)
-
-            plt.plot(mmr_history[role]["dates"], mmr_history[role]["mmr"])
-            legend.append(role)
-
-        plt.legend(legend)
-        plt.title(f"MMR variation in the last month for {player.name}")
-        mplcyberpunk.add_glow_effects()
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
-            plt.savefig(temp.name)
-            file = discord.File(temp.name, filename=temp.name)
-            await ctx.send(file=file)
-            plt.close()
-            temp.close()
-
-    @commands.command(help_index=5, aliases=["champs_stats", "champion_stats", "champ_stat"])
-    async def champions_stats(self, ctx: commands.Context, user_id=None, date_start=None):
-        """Returns your games total and winrate for all champions.
-        """
-        try:
-            player = await self.get_player_with_team_check(ctx, user_id)
-        except PermissionError:
-            return
-
-        date_start = dateparser.parse(date_start) if date_start else date_start
-
-        stats = player.get_champions_stats(date_start)
-
-        table = []
-        for champion_id in stats:
-            table.append(
-                [
-                    lit.get_name(champion_id),
-                    f"{stats[champion_id].role.capitalize()}",
-                    stats[champion_id].games,
-                    f"{stats[champion_id].wins / stats[champion_id].games * 100:.1f}%",
-                ]
-            )
-
-        # Sorting the table by games total
-        table = sorted(table, key=lambda x: -x[2])
-        # Adding the header last to not screw with the sorting
-        table.insert(0, ["Champion", "Role", "Games", "Winrate"])
-
-        await ctx.send(f'```{tabulate(table, headers="firstrow")}```')
-
-    @commands.command(hidden=True)
-    @commands.has_permissions(administrator=True)
-    async def team(self, ctx: commands.Context, user_id: int, team_name: str):
-        """Sets a player’s team to the given team name
-        """
-        player = await self.bot.get_player(None, user_id)
-        player.team = team_name.upper()
-
-        await ctx.send(f"{player.name}’s team has been set to {player.team}")
-
-    @commands.command(help_index=6)
-    async def view_team(self, ctx: commands.Context):
-        """View your current team and team mates.
-        """
-        player = await self.bot.get_player(ctx)
-
-        if not player.team:
-            await ctx.send(f"Your team has not been set yet. Please contact Inero to get tagged.")
-            return
-
-        teammates_session = get_session()
-
-        teammates = teammates_session.query(Player).filter(Player.team == player.team)
+            game_id = game.id
 
         await ctx.send(
-            f"You are currently part of {player.team}. Please contact Inero for changes.\n"
-            f'Currently in {player.team}: {", ".join([t.name for t in teammates])}'
+            f"Champion for game {game_id} was set to "
+            f"{lol_id_tools.get_name(champion_id, object_type='champion')} for {ctx.author.display_name}"
         )
 
-    async def get_player_with_team_check(self, ctx: commands.Context, user_id: int) -> Player:
-        # With no ID supplied, we just return the caller
-        if not user_id:
-            return await self.bot.get_player(ctx, None)
+    @commands.command(aliases=["match_history", "mh"])
+    async def history(self, ctx: commands.Context):
+        # TODO LOW PRIO Add an @ user for admins
+        """
+        Displays your games history
 
-        calling_player = await self.bot.get_player(ctx)
-        player = await self.bot.get_player(None, user_id)
+        Example:
+            !history
+        """
+        # TODO LOW PRIO Make it not output the server only in DMs, otherwise filter on the server
 
-        if (
-            calling_player.team
-            and calling_player.team != player.team
-            and not ctx.author.guild_permissions.administrator
-        ):
-            await ctx.send(f"You don’t have the permission to see {player.name}’s stats")
-            raise PermissionError
+        with session_scope() as session:
+            session.expire_on_commit = False
 
-        return player
+            game_participant_list = (
+                session.query(Game, GameParticipant)
+                .select_from(Game)
+                .join(GameParticipant)
+                .filter(GameParticipant.player_id == ctx.author.id)
+                .order_by(Game.start.desc())
+                .limit(100)
+            ).all()
+
+        pages = menus.MenuPages(
+            source=HistoryPagesSource(game_participant_list, self.bot, player_name=ctx.author.display_name),
+            delete_message_after=True,
+        )
+        await pages.start(ctx)
+
+    @commands.command(aliases=["mmr", "rank", "rating"])
+    async def stats(self, ctx: commands.Context):
+        """
+        Returns your rank, MMR, and games played
+
+        Example:
+            !rank
+        """
+        # TODO LOW PRIO Make it not output the server only in DMs, otherwise filter on the server
+        damon = 227956630338142209
+        
+        if ctx.author.id == damon:
+            await ctx.send('Hardstuck Gold')
+            return
+
+        with session_scope() as session:
+            rating_objects = (
+                session.query(
+                    PlayerRating,
+                    func.count().label("count"),
+                    (
+                        sqlalchemy.func.sum((Game.winner == GameParticipant.side).cast(sqlalchemy.Integer))
+                    ).label("wins"),
+                )
+                .select_from(PlayerRating)
+                .join(GameParticipant, isouter=True)
+                .join(Game, isouter=True)
+                .filter(PlayerRating.player_id == ctx.author.id)
+                .group_by(PlayerRating)
+            )
+
+            table = []
+
+            for row in rating_objects:
+                rank = (
+                    session.query(func.count())
+                    .select_from(PlayerRating)
+                    .filter(PlayerRating.player_server_id == row[0].player_server_id)
+                    .filter(PlayerRating.role == row[0].role)
+                    .filter(PlayerRating.mmr > row[0].mmr)
+                ).first()[0]
+                count = 0 if row.count is None else row.count
+                wins = 0 if row.wins is None else row.wins
+                table.append(
+                    [
+                        self.bot.get_guild(row[0].player_server_id).name,
+                        row[0].role,
+                        inflect_engine.ordinal(rank + 1),
+                        round(row[0].mmr, 2) if not hasattr(row, 'mmr') else round(row.mmr, 2),
+                        count,
+                        f"{int(wins / count * 100)}%",
+                    ]
+                )
+
+            # Sorting the table by games played
+            table = sorted(table, key=lambda x: -x[4])
+
+            # Added afterwards to allow sorting first
+            table.insert(0, ["Server", "Role", "Rank", "MMR", "Games", "Win%"])
+
+        await ctx.send(f"Ranks for {ctx.author.display_name}" f'```{tabulate(table, headers="firstrow")}```')
+
+    @commands.command(aliases=["rankings"])
+    @guild_only()
+    async def ranking(self, ctx: commands.Context, role: RoleConverter() = None):
+        """
+        Displays the top players on the server
+
+        A role can be supplied to only display the ranking for this role
+
+        Example:
+            !ranking
+            !ranking mid
+        """
+        with session_scope() as session:
+            session.expire_on_commit = False
+
+            ratings = (
+                session.query(
+                    Player,
+                    PlayerRating.player_server_id,
+                    PlayerRating.mmr,
+                    PlayerRating.role,
+                    func.count().label("count"),
+                    (
+                        sqlalchemy.func.sum((Game.winner == GameParticipant.side).cast(sqlalchemy.Integer))
+                    ).label(
+                        "wins"
+                    ),  # A bit verbose for sure
+                )
+                .select_from(Player)
+                .join(PlayerRating)
+                .join(GameParticipant)
+                .join(Game)
+                .filter(Player.server_id == ctx.guild.id)
+                .group_by(Player, PlayerRating)
+                .order_by(PlayerRating.mmr.desc())
+            )
+
+            if role:
+                ratings = ratings.filter(PlayerRating.role == role)
+
+            ratings = ratings.limit(100).all()
+
+        pages = menus.MenuPages(source=RankingPagesSource(ratings, self.bot), delete_message_after=True)
+        await pages.start(ctx)
+
+    # TODO LOW PRIO fancy mmr_history graph once again
